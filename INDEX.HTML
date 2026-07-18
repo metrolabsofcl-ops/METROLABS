@@ -4,6 +4,7 @@
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
 <title>MetroLabs — Home Collection</title>
+<script src="https://unpkg.com/@zxing/library@0.21.0/umd/index.min.js"></script>
 <style>
   :root{
     --bg:#eef6f1;
@@ -2948,9 +2949,7 @@ var qrcode = function() {
   const SAMPLE_STAGES = ['collected','registered','delivered'];
   const PACKAGE_DEFAULT_TUBES = 3; // Supreme / Ultima packages default to 3 tubes to scan
   let pendingTubesApptId = null;
-  let scannerStream = null;
-  let scannerRAF = null;
-  let barcodeDetector = null;
+  // (scanner state now lives in zxingReader, declared near openScanner)
 
   function detectPackage(testsStr){
     const s = (testsStr||'').toLowerCase();
@@ -3833,40 +3832,53 @@ var qrcode = function() {
     localStorage.setItem('metrolabs_sync_dirty', '1'); // ride the same auto-retry as everything else
   }
 
+  let zxingReader = null; // ZXing.BrowserMultiFormatReader instance, works on iOS Safari unlike BarcodeDetector
+
   async function openScanner(tubeIdx){
     scanTargetIdx = tubeIdx; // still supported: rescanning one specific tube slot
     scannerManualInput.value = '';
     scannerStatus.textContent = 'Starting camera…';
     scannerOverlay.classList.add('open');
     renderLiveScannedList();
-    try{
-      scannerStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
-      scannerVideo.srcObject = scannerStream;
-      scannerStatus.textContent = 'Hold each tube barcode inside the box — it scans automatically.';
-      if('BarcodeDetector' in window){
-        try{
-          barcodeDetector = new BarcodeDetector({ formats: ['code_128','code_39','ean_13','ean_8','upc_a','upc_e','qr_code'] });
-          scanLoop();
-        }catch(e){
-          scannerStatus.textContent = 'Live detection unavailable — type the code below.';
-        }
-      } else {
-        scannerStatus.textContent = 'Live detection not supported on this browser — type the code below.';
-      }
-    }catch(e){
-      scannerStatus.textContent = 'Camera unavailable. Enter the barcode manually below.';
-    }
-  }
 
-  async function scanLoop(){
-    if(!scannerOverlay.classList.contains('open')) return;
+    if(typeof ZXing === 'undefined'){
+      scannerStatus.textContent = 'Scanner library failed to load — check your internet connection, or type the code below.';
+      return;
+    }
+
+    if(!window.isSecureContext){
+      scannerStatus.textContent = 'Camera needs a secure connection (https://) to work on this phone. Open this page via https, or type the code below.';
+      return;
+    }
+
+    if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+      scannerStatus.textContent = 'This browser can\'t access the camera. Try Safari or Chrome, or type the code below.';
+      return;
+    }
+
     try{
-      const codes = await barcodeDetector.detect(scannerVideo);
-      if(codes && codes.length){
-        applyScannedCode(codes[0].rawValue);
+      zxingReader = new ZXing.BrowserMultiFormatReader();
+      const devices = await ZXing.BrowserCodeReader.listVideoInputDevices();
+      const backCam = devices.find(d => /back|rear|environment/i.test(d.label)) || (devices.length ? devices[devices.length-1] : undefined);
+      const deviceId = backCam ? backCam.deviceId : undefined;
+
+      scannerStatus.textContent = 'Hold each tube barcode inside the box — it scans automatically.';
+
+      await zxingReader.decodeFromVideoDevice(deviceId, scannerVideo, (result, err) => {
+        if(!scannerOverlay.classList.contains('open')) return; // modal closed mid-scan, ignore stray callbacks
+        if(result){
+          applyScannedCode(result.getText());
+        }
+        // NotFoundException fires continuously while no barcode is in view — expected, not an error.
+      });
+    }catch(e){
+      console.error('Camera/scanner init failed:', e);
+      if(e && e.name === 'NotAllowedError'){
+        scannerStatus.textContent = 'Camera permission denied. Allow camera access in your browser settings, or type the code below.';
+      } else {
+        scannerStatus.textContent = 'Camera unavailable. Enter the barcode manually below.';
       }
-    }catch(e){ /* ignore per-frame errors */ }
-    scannerRAF = requestAnimationFrame(scanLoop);
+    }
   }
 
   function applyScannedCode(code){
@@ -3924,8 +3936,15 @@ var qrcode = function() {
 
   function closeScanner(){
     scannerOverlay.classList.remove('open');
-    if(scannerRAF) cancelAnimationFrame(scannerRAF);
-    if(scannerStream){ scannerStream.getTracks().forEach(t=>t.stop()); scannerStream = null; }
+    if(zxingReader){
+      try{ zxingReader.reset(); }catch(e){ /* already stopped, ignore */ }
+      zxingReader = null;
+    }
+    // ZXing attaches its own stream to the video element — stop any tracks left on it as a safety net
+    if(scannerVideo.srcObject){
+      try{ scannerVideo.srcObject.getTracks().forEach(t=>t.stop()); }catch(e){}
+      scannerVideo.srcObject = null;
+    }
     lastScanCode = null;
   }
   document.getElementById('scanner-cancel').onclick = closeScanner;
